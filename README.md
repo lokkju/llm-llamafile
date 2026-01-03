@@ -137,10 +137,13 @@ The plugin stores files in platform-specific cache directories:
 
 1. **First run**: Downloads llamafile binary for your platform
 2. **On query**: Checks if server is running; starts it if needed
-3. **Server startup**: Launches llamafile with your model
-4. **Query execution**: Forwards request to local server
-5. **Idle timeout**: After 5 minutes of inactivity, server shuts down automatically
-6. **Next query**: Server restarts automatically when needed
+3. **Server startup**: Launches llamafile with your model and spawns a watchdog process
+4. **Query execution**: Forwards request to local server; updates state file mtime
+5. **Watchdog monitoring**: Detached watchdog process monitors state file mtime
+6. **Idle timeout**: After 5 minutes of no mtime updates, watchdog kills server
+7. **Next query**: Server restarts automatically when needed
+
+The watchdog process is fully detached and persists after the `llm` command exits, ensuring proper idle timeout even when the parent process terminates.
 
 ## Advanced Usage
 

@@ -9,7 +9,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import urllib.request
 import urllib.error
@@ -109,10 +108,7 @@ class ServerManager:
         self.port = port
         self.idle_timeout = idle_timeout
         self.process: Optional[subprocess.Popen] = None
-        self.timer: Optional[threading.Timer] = None
-        self.lock = threading.Lock()
         self._state_file = STATE_FILE
-        self._shutting_down = False
 
         # Register cleanup on exit
         atexit.register(self._cleanup)
@@ -180,25 +176,81 @@ class ServerManager:
                 time.sleep(0.5)
         return False
 
-    def _start_timeout_timer(self):
-        """Start/restart the idle timeout timer."""
-        with self.lock:
-            if self.timer:
-                self.timer.cancel()
+    def _start_watchdog(self, server_pid: int):
+        """Spawn a background watchdog process that kills server after idle timeout."""
+        if self.idle_timeout <= 0:
+            return
 
-            if self.idle_timeout > 0 and not self._shutting_down:
-                self.timer = threading.Timer(self.idle_timeout, self._timeout_shutdown)
-                self.timer.daemon = True
-                self.timer.start()
+        if platform.system() == "Windows":
+            # On Windows, spawn a detached Python process as watchdog
+            script = f'''
+import time
+import sys
+import subprocess
+from pathlib import Path
 
-    def _timeout_shutdown(self):
-        """Called when idle timeout expires."""
-        print("Llamafile server idle timeout - shutting down", file=sys.stderr)
-        self.stop()
+state_file = Path(r"{self._state_file}")
+idle_timeout = {self.idle_timeout}
+server_pid = {server_pid}
+
+while True:
+    time.sleep(30)
+    if not state_file.exists():
+        sys.exit(0)
+    try:
+        mtime = state_file.stat().st_mtime
+        if time.time() - mtime > idle_timeout:
+            subprocess.run(["taskkill", "/F", "/PID", str(server_pid)], capture_output=True)
+            state_file.unlink(missing_ok=True)
+            sys.exit(0)
+    except:
+        sys.exit(0)
+'''
+            subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            # On Unix, fork a detached watchdog process
+            pid = os.fork()
+            if pid == 0:
+                # Child process - detach from parent
+                os.setsid()
+
+                # Fork again to ensure we're fully detached
+                pid2 = os.fork()
+                if pid2 == 0:
+                    # Grandchild - the actual watchdog
+                    # Close all file descriptors
+                    sys.stdout.close()
+                    sys.stderr.close()
+                    sys.stdin.close()
+
+                    while True:
+                        time.sleep(30)
+                        if not self._state_file.exists():
+                            os._exit(0)
+                        try:
+                            mtime = self._state_file.stat().st_mtime
+                            if time.time() - mtime > self.idle_timeout:
+                                os.kill(server_pid, signal.SIGTERM)
+                                self._state_file.unlink(missing_ok=True)
+                                os._exit(0)
+                        except (OSError, FileNotFoundError):
+                            os._exit(0)
+
+                # Parent of grandchild exits immediately
+                os._exit(0)
 
     def touch(self):
-        """Reset idle timeout (called on each request)."""
-        self._start_timeout_timer()
+        """Reset idle timeout by updating state file mtime."""
+        if self._state_file.exists():
+            try:
+                self._state_file.touch()
+            except OSError:
+                pass
 
     def start(self, model_path: Optional[Path] = None, context_size: int = 8192,
               n_gpu_layers: int = -1) -> bool:
@@ -260,8 +312,8 @@ class ServerManager:
                 self.stop()
                 raise RuntimeError("Server failed to start - check model compatibility")
 
-            # Start idle timeout
-            self._start_timeout_timer()
+            # Start watchdog for idle timeout
+            self._start_watchdog(self.process.pid)
 
             return True
         except Exception as e:
@@ -269,14 +321,7 @@ class ServerManager:
             raise RuntimeError(f"Failed to start server: {e}")
 
     def stop(self):
-        """Stop the server."""
-        self._shutting_down = True
-
-        with self.lock:
-            if self.timer:
-                self.timer.cancel()
-                self.timer = None
-
+        """Stop the server and clean up state."""
         state = self._load_state()
         if not state:
             return
@@ -300,7 +345,6 @@ class ServerManager:
             pass
         finally:
             self._clear_state()
-            self._shutting_down = False
 
     def _cleanup(self):
         """Cleanup on exit."""

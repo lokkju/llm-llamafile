@@ -1,5 +1,6 @@
 import platform
 import pytest
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 from urllib.error import URLError
@@ -31,7 +32,6 @@ def test_server_manager_initialization():
     assert manager.port == 8081
     assert manager.idle_timeout == 600
     assert manager.process is None
-    assert manager.timer is None
 
 
 def test_server_manager_state_operations(tmp_path):
@@ -134,20 +134,23 @@ def test_server_start_with_invalid_model(mock_popen, mock_download):
         manager.start(model_path=Path("/nonexistent/model.llamafile"))
 
 
-def test_touch_resets_timer():
-    """Test that touch() resets the idle timer."""
+def test_touch_updates_mtime(tmp_path):
+    """Test that touch() updates state file mtime."""
+    state_file = tmp_path / "test_state.json"
     manager = llm_llamafile.ServerManager(idle_timeout=10)
+    manager._state_file = state_file
 
-    # Start a timer
-    manager._start_timeout_timer()
-    first_timer = manager.timer
-    assert first_timer is not None
+    # Create state file
+    manager._save_state({"pid": 12345, "port": 8080})
+    original_mtime = state_file.stat().st_mtime
 
-    # Touch should cancel old timer and start new one
+    # Wait a bit then touch
+    time.sleep(0.1)
     manager.touch()
-    second_timer = manager.timer
-    assert second_timer is not None
-    assert first_timer != second_timer
+
+    # mtime should be updated
+    new_mtime = state_file.stat().st_mtime
+    assert new_mtime > original_mtime
 
 
 def test_constants():
